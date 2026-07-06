@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-entanglement_ml_pipeline_v2.py
+entanglement_ml_pipeline.py
 
 A reusable pipeline for studying whether SVMs and other machine-learning models
 can learn the separability boundary for bipartite quantum states.
@@ -28,23 +28,38 @@ Labels
 y = -1  entangled
 y = +1  separable
 
-The saved datasets never contain raw density matrices. They contain feature
-columns, y, and optionally a diagnostic purity column. The optional NPZ bundle stores exactly:
+The saved datasets never contain raw density matrices. They contain only feature
+columns and y. The optional NPZ bundle stores exactly:
     SU_features, Moment_features, RMInvariant_features, y
 
 Example CLI usage
 -----------------
-# Generate a balanced qubit-qubit dataset.
+# Method 1: existing logic. Known separable mixtures plus metric entangled search.
 python entanglement_ml_pipeline.py generate \
-    --system 2x2 --metric bures --n-entangled 1000 --n-separable 1000 \
+    --system 2x2 --metric bures --generation-method 1 \
+    --n-entangled 1000 --n-separable 1000 \
     --out data/qubit_bures.csv
 
-# Generate a qutrit-qutrit dataset. Provide the attached script path so PPT
-# qutrit states can be sent through DPS/Gilbert.
+# Method 2: metric-consistent rejection sampling for both labels.
 python entanglement_ml_pipeline.py generate \
-    --system 3x3 --metric hs --n-entangled 500 --n-separable 500 \
+    --system 3x3 --metric hs --generation-method 2 \
+    --n-entangled 500 --n-separable 500 \
     --qutrit-script /path/to/3x3_svm.py \
     --out data/qutrit_hs.csv
+
+# Method 3: metric-local separable mixtures; entangled rows fall back to Method 1.
+python entanglement_ml_pipeline.py generate \
+    --system 2x2 --metric bures --generation-method 3 \
+    --sep-mixture-terms 16 --n-entangled 1000 --n-separable 1000 \
+    --out data/qubit_method3_bures.csv
+
+# Method 4: controlled depolarization after a rejection threshold.
+python entanglement_ml_pipeline.py generate \
+    --system 3x3 --metric bures --generation-method 4 \
+    --method4-depolarize-after 250 --method4-depolarize-step 0.01 \
+    --n-entangled 500 --n-separable 500 \
+    --qutrit-script /path/to/3x3_svm.py \
+    --out data/qutrit_method4_bures.csv
 
 # Evaluate feature groups and models.
 python entanglement_ml_pipeline.py evaluate \
@@ -55,11 +70,19 @@ python entanglement_ml_pipeline.py tsne \
     --dataset data/qubit_bures.csv --feature-set ALL \
     --out results/qubit_bures/tsne_ALL.png
 
-# Compare baseline training with purity-constrained training while testing on
-# an unrestricted distribution.
+# Plot held-out accuracy degradation after removing top-ranked RFE features.
+python entanglement_ml_pipeline.py ts_rfe_ablation \
+    --dataset data/qubit_bures.csv --feature-set SU \
+    --model LinearSVC --cv-folds 5 --repeats 5 \
+    --out results/rfe_ablation_SU.png \
+    --out-csv results/rfe_ablation_SU.csv
+
+# Compare unrestricted training with purity-constrained training while testing
+# on the same unrestricted test distribution.
 python entanglement_ml_pipeline.py purity_experiment \
     --system 2x2 --metric bures --eta 0.02 \
-    --n-train 1000 --n-test 1000 --out-dir results/purity_test
+    --n-train 1000 --n-test 1000 --features Moments \
+    --out-dir results/purity_experiment
 """
 
 from __future__ import annotations
@@ -88,12 +111,13 @@ import sklearn.metrics as sk_metrics
 
 from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import RFECV
+from sklearn.feature_selection import RFE, RFECV
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
+    get_scorer,
 )
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.neural_network import MLPClassifier
@@ -124,6 +148,13 @@ class DatasetConfig:
     metric:
         Either "bures" or "hs"/"hilbert-schmidt". This controls the random
         full-state distribution used to draw candidate entangled states.
+    generation_method:
+        Selects one of the state-generation methods exposed by the generate
+        CLI command:
+            1 = existing logic,
+            2 = metric-consistent rejection sampling,
+            3 = metric-distributed separable mixtures plus Method 1 entangled,
+            4 = controlled depolarization of metric candidates.
     n_entangled:
         Number of entangled examples to accept.
     n_separable:
@@ -135,19 +166,16 @@ class DatasetConfig:
     max_draws:
         Safety cap on candidate full-state draws while searching for entangled
         metric states.
-    ppt_tol:
-        Numerical tolerance for declaring a partial transpose non-positive.
-    qutrit_script:
-        Path to the attached 3x3_svm.py script. Needed only when a qutrit-qutrit
-        candidate is PPT and must be tested by the DPS/Gilbert logic.
-    reject_ppt_qutrit_without_script:
-        If True, PPT qutrit candidates are rejected when no external script is
-        supplied. If False, an error is raised.
+    method4_depolarize_after:
+        Method 4 starts controlled depolarization only after this many rejected
+        or unneeded candidates.
+    method4_depolarize_step:
+        Method 4 decreases p by this step in rho(p)=p*rho+(1-p)I/D while
+        searching monotonically for a PPT state.
     purity_filter:
         If True, accept generated states only in the two extreme-purity bands
-        [1/d, 1/d + eta] or [1 - eta, 1], where d is the total Hilbert-space
-        dimension. This option is intended for controlled training-data
-        experiments and is off by default.
+        [1/D, 1/D + eta] or [1 - eta, 1], where D is the total Hilbert-space
+        dimension.
     eta:
         Width of the low- and high-purity acceptance windows used when
         purity_filter is enabled.
@@ -157,25 +185,35 @@ class DatasetConfig:
         samplers and rejects candidates outside the windows.
     store_purity:
         If True, add a diagnostic ``purity`` column to generated CSV datasets.
-        This column is ignored by the existing feature-selection and model
-        evaluation code because feature columns are inferred by prefix.
+        The column is never inferred as a classifier feature.
+    ppt_tol:
+        Numerical tolerance for declaring a partial transpose non-positive.
+    qutrit_script:
+        Path to the attached 3x3_svm.py script. Needed only when a qutrit-qutrit
+        candidate is PPT and must be tested by the DPS/Gilbert logic.
+    reject_ppt_qutrit_without_script:
+        If True, PPT qutrit candidates are rejected when no external script is
+        supplied. If False, an error is raised.
     random_state:
         Seed for reproducible sampling.
     """
 
     system: str = "2x2"
     metric: str = "bures"
+    generation_method: int = 1
     n_entangled: int = 1000
     n_separable: int = 1000
     sep_mixture_terms: int = 1
     max_draws: int = 10_000_000
-    ppt_tol: float = 1e-10
-    qutrit_script: Optional[str] = None
-    reject_ppt_qutrit_without_script: bool = True
+    method4_depolarize_after: int = 1000
+    method4_depolarize_step: float = 0.01
     purity_filter: bool = False
     eta: float = 0.02
     purity_sampling_mode: str = "targeted"
     store_purity: bool = True
+    ppt_tol: float = 1e-10
+    qutrit_script: Optional[str] = None
+    reject_ppt_qutrit_without_script: bool = True
     random_state: Optional[int] = 42
 
 
@@ -185,7 +223,7 @@ class EvaluationConfig:
 
     test_size: float = 0.30
     random_state: int = 42
-    use_rfe: bool = True
+    use_rfe: bool = False
     rfe_step: float = 0.10
     rfe_cv: int = 5
     n_jobs: int = -1
@@ -240,7 +278,7 @@ def validate_eta(eta: float) -> float:
 
 
 def purity_window_bounds(total_dim: int, eta: float) -> Dict[str, Tuple[float, float]]:
-    """Return low/high extreme-purity interval bounds for total dimension d."""
+    """Return low/high extreme-purity interval bounds for total dimension D."""
 
     eta_value = validate_eta(eta)
     d = int(total_dim)
@@ -251,6 +289,21 @@ def purity_window_bounds(total_dim: int, eta: float) -> Dict[str, Tuple[float, f
         "low": (min_purity, min(min_purity + eta_value, 1.0)),
         "high": (max(1.0 - eta_value, min_purity), 1.0),
     }
+
+
+def maximal_eta_for_dimension(total_dim: int) -> float:
+    """Return the eta value for which the two purity windows cover [1/D, 1]."""
+
+    d = int(total_dim)
+    if d <= 0:
+        raise ValueError("total_dim must be positive.")
+    return (d - 1.0) / (2.0 * d)
+
+
+def purity_windows_cover_full_range(total_dim: int, eta: float, atol: float = 1e-12) -> bool:
+    """True when the configured windows cover the full physical purity range."""
+
+    return validate_eta(eta) >= maximal_eta_for_dimension(total_dim) - atol
 
 
 def purity_regime(value: float, total_dim: int, eta: float, atol: float = 1e-12) -> str:
@@ -363,11 +416,54 @@ def sample_purity_target(total_dim: int, eta: float, rng: np.random.Generator, r
     return float(rng.uniform(lower, upper))
 
 
-def mix_with_identity_to_purity(seed_rho: np.ndarray, target_purity: float) -> np.ndarray:
-    """Mix a seed state with I/d so the output has the requested purity.
+def sample_reachable_purity_target(
+    seed_rho: np.ndarray,
+    total_dim: int,
+    eta: float,
+    rng: np.random.Generator,
+    regime: str,
+) -> float:
+    """Sample a purity-window target reachable by mixing seed_rho with I/D.
 
-    For rho(lambda) = (1 - lambda) I/d + lambda sigma,
-    Tr[rho(lambda)^2] = 1/d + lambda^2 (Tr[sigma^2] - 1/d).
+    Since rho(lambda) = (1-lambda)I/D + lambda*sigma can only move from the
+    maximally mixed purity 1/D up to purity(sigma), the target interval must be
+    intersected with [1/D, purity(seed_rho)].
+    """
+
+    bounds = purity_window_bounds(total_dim, eta)
+    if regime not in bounds:
+        raise ValueError("regime must be 'low' or 'high'.")
+
+    min_purity = 1.0 / float(total_dim)
+    seed_purity = purity(as_density_matrix(seed_rho))
+    if seed_purity < min_purity - 1e-12:
+        raise ValueError(f"seed purity {seed_purity} is below the physical minimum {min_purity}.")
+
+    if regime == "low":
+        lower = min_purity
+        upper = min(bounds["low"][1], seed_purity)
+    else:
+        lower = max(bounds["high"][0], min_purity)
+        upper = seed_purity
+
+    if upper < lower - 1e-12:
+        raise ValueError(
+            f"No reachable {regime} purity target for seed purity {seed_purity}; "
+            f"reachable interval [1/D, seed_purity]=[{min_purity}, {seed_purity}], "
+            f"window={bounds[regime]}."
+        )
+
+    upper = max(lower, upper)
+    if np.isclose(lower, upper):
+        return float(lower)
+    return float(rng.uniform(lower, upper))
+
+
+def mix_with_identity_to_purity(seed_rho: np.ndarray, target_purity: float) -> np.ndarray:
+    """Mix a seed state with I/D so the output has the requested purity.
+
+    For rho(lambda) = (1 - lambda) I/D + lambda sigma,
+    Tr[rho(lambda)^2] = 1/D + lambda^2 (Tr[sigma^2] - 1/D).
     """
 
     sigma = as_density_matrix(seed_rho)
@@ -377,7 +473,7 @@ def mix_with_identity_to_purity(seed_rho: np.ndarray, target_purity: float) -> n
     target = float(target_purity)
 
     if target < min_purity - 1e-12:
-        raise ValueError("target_purity is below the maximally mixed purity 1/d.")
+        raise ValueError("target_purity is below the maximally mixed purity 1/D.")
     if target > seed_purity + 1e-12:
         raise ValueError(
             f"target_purity={target} exceeds seed purity={seed_purity}; choose a purer seed state."
@@ -389,47 +485,6 @@ def mix_with_identity_to_purity(seed_rho: np.ndarray, target_purity: float) -> n
     lam = float(np.clip(lam, 0.0, 1.0))
     rho = (1.0 - lam) * np.eye(d, dtype=np.complex128) / float(d) + lam * sigma
     return as_density_matrix(rho)
-
-
-def sample_extreme_purity_separable_state(
-    d_a: int,
-    d_b: int,
-    rng: np.random.Generator,
-    eta: float,
-    regime: str,
-    mixture_terms: int = 1,
-) -> np.ndarray:
-    """Efficiently sample a known separable state in a target purity regime."""
-
-    total_dim = d_a * d_b
-    target = sample_purity_target(total_dim, eta, rng, regime=regime)
-    if regime == "high":
-        # Pure product seeds can reach all high-purity targets up to 1.
-        seed = random_product_state(d_a, d_b, rng)
-    else:
-        # Mixing any separable seed with the maximally mixed state remains
-        # separable. More mixture terms can provide more varied low-purity
-        # separable seeds without affecting the purity guarantee.
-        seed = random_separable_state(d_a, d_b, rng, mixture_terms=max(1, mixture_terms))
-    return mix_with_identity_to_purity(seed, target)
-
-
-def sample_extreme_purity_entangled_candidate(
-    total_dim: int,
-    rng: np.random.Generator,
-    eta: float,
-) -> np.ndarray:
-    """Efficiently sample a high-purity full-system candidate.
-
-    For small eta, entangled states in the low-purity band may be absent or very
-    rare. High-purity Haar-pure seeds mixed with I/d give candidates that pass
-    the purity filter with near-unit acceptance, while the existing PPT/DPS
-    labelling step still verifies the final entangled label.
-    """
-
-    target = sample_purity_target(total_dim, eta, rng, regime="high")
-    seed = haar_random_pure_state(total_dim, rng)
-    return mix_with_identity_to_purity(seed, target)
 
 
 def random_product_state(d_a: int, d_b: int, rng: np.random.Generator) -> np.ndarray:
@@ -458,6 +513,42 @@ def random_separable_state(
     for w in weights:
         rho += w * random_product_state(d_a, d_b, rng)
     return as_density_matrix(rho)
+
+
+def sample_extreme_purity_separable_state(
+    d_a: int,
+    d_b: int,
+    rng: np.random.Generator,
+    eta: float,
+    regime: str,
+    mixture_terms: int = 1,
+) -> np.ndarray:
+    """Efficiently sample a known separable state in a target purity regime."""
+
+    total_dim = d_a * d_b
+    if regime == "high":
+        seed = random_product_state(d_a, d_b, rng)
+    else:
+        seed = random_separable_state(d_a, d_b, rng, mixture_terms=max(1, mixture_terms))
+    target = sample_reachable_purity_target(seed, total_dim, eta, rng, regime=regime)
+    return mix_with_identity_to_purity(seed, target)
+
+
+def sample_extreme_purity_entangled_candidate(
+    total_dim: int,
+    rng: np.random.Generator,
+    eta: float,
+) -> np.ndarray:
+    """Efficiently sample a high-purity full-system candidate.
+
+    This targeted mode is a controlled extreme-purity distribution. It is not
+    a strict Bures- or Hilbert-Schmidt-conditioned sample. Existing PPT/DPS
+    labelling still verifies the final entangled label.
+    """
+
+    seed = haar_random_pure_state(total_dim, rng)
+    target = sample_reachable_purity_target(seed, total_dim, eta, rng, regime="high")
+    return mix_with_identity_to_purity(seed, target)
 
 
 def partial_transpose(
@@ -681,7 +772,7 @@ def feature_row(
     rho: np.ndarray,
     dims: Tuple[int, int],
     y: int,
-    include_purity: bool = True,
+    include_purity: bool = False,
 ) -> Dict[str, float]:
     """Return a flat feature row suitable for a pandas DataFrame."""
 
@@ -777,7 +868,7 @@ class QutritDPSGilbertLabeler:
                     if self.verbose_external:
                         external_label = module.entanglement_label(rho_torch, 3, 3)
                     else:
-                        with open(os.devnull, "w") as devnull:
+                        with open(os.devnull, "w", encoding="utf-8", errors="replace") as devnull:
                             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                                 external_label = module.entanglement_label(rho_torch, 3, 3)
                 finally:
@@ -797,33 +888,234 @@ class QutritDPSGilbertLabeler:
 # Dataset generation and storage
 # ---------------------------------------------------------------------------
 
-def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
+def canonical_generation_method(method: int | str) -> int:
+    """Return a validated state-generation method id."""
+
+    try:
+        method_id = int(method)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("generation_method must be one of 1, 2, 3, or 4.") from exc
+    if method_id not in {1, 2, 3, 4}:
+        raise ValueError("generation_method must be one of 1, 2, 3, or 4.")
+    return method_id
+
+
+def build_qutrit_labeler(config: DatasetConfig, dims: Tuple[int, int]) -> Optional[QutritDPSGilbertLabeler]:
+    """Create the attached qutrit DPS/Gilbert labeler only when needed."""
+
+    if dims != (3, 3):
+        return None
+    return QutritDPSGilbertLabeler(
+        script_path=config.qutrit_script,
+        ppt_tol=config.ppt_tol,
+        reject_ppt_without_script=config.reject_ppt_qutrit_without_script,
+    )
+
+
+def label_with_existing_criteria(
+    rho: np.ndarray,
+    dims: Tuple[int, int],
+    config: DatasetConfig,
+    qutrit_labeler: Optional[QutritDPSGilbertLabeler],
+) -> Optional[int]:
+    """Label a state with the existing PPT/DPS/Gilbert decision logic."""
+
+    if dims == (2, 2):
+        return ppt_label(rho, dims=dims, tol=config.ppt_tol, subsystem=0)
+    if dims == (3, 3):
+        assert qutrit_labeler is not None
+        return qutrit_labeler(rho)
+    raise NotImplementedError("Only 2x2 and 3x3 systems are supported.")
+
+
+def canonical_purity_sampling_mode(mode: str) -> str:
+    """Return a validated purity sampling mode."""
+
+    m = str(mode).strip().lower().replace("_", "-")
+    if m in {"targeted", "rejection"}:
+        return m
+    raise ValueError("purity_sampling_mode must be 'targeted' or 'rejection'.")
+
+
+def validate_purity_generation_config(config: DatasetConfig) -> Tuple[float, str]:
+    """Validate purity-related config fields and return normalized values."""
+
+    eta = validate_eta(config.eta)
+    mode = canonical_purity_sampling_mode(config.purity_sampling_mode)
+    if config.purity_filter and eta <= 0.0:
+        raise ValueError("purity_filter requires eta > 0.")
+    return eta, mode
+
+
+def purity_accepts_state(rho: np.ndarray, dims: Tuple[int, int], config: DatasetConfig) -> bool:
+    """Return True when rho satisfies the configured purity filter."""
+
+    if not config.purity_filter:
+        return True
+    d = dims[0] * dims[1]
+    return purity_in_extreme_regime(purity(rho), total_dim=d, eta=config.eta)
+
+
+def feature_row_for_config(
+    rho: np.ndarray,
+    dims: Tuple[int, int],
+    label: int,
+    config: DatasetConfig,
+) -> Dict[str, float]:
+    """Build a row, optionally carrying the diagnostic purity column."""
+
+    return feature_row(rho, dims, label, include_purity=config.store_purity)
+
+
+def append_state_row(
+    rows: List[Dict[str, float]],
+    rho: np.ndarray,
+    dims: Tuple[int, int],
+    label: int,
+    config: DatasetConfig,
+) -> None:
+    """Append a generated state using the configured diagnostic columns."""
+
+    rows.append(feature_row_for_config(rho, dims, label, config))
+
+
+def targeted_purity_regime(rng: np.random.Generator) -> str:
+    """Pick a low/high extreme-purity regime for targeted sampling."""
+
+    return "high" if bool(rng.integers(0, 2)) else "low"
+
+
+def sample_full_state_candidate_for_config(
+    metric: str,
+    total_dim: int,
+    rng: np.random.Generator,
+    config: DatasetConfig,
+) -> np.ndarray:
+    """Sample a full-system candidate respecting the configured purity mode."""
+
+    _, mode = validate_purity_generation_config(config)
+    if (
+        config.purity_filter
+        and mode == "targeted"
+        and not purity_windows_cover_full_range(total_dim, config.eta)
+    ):
+        regime = targeted_purity_regime(rng)
+        if regime == "high":
+            seed = haar_random_pure_state(total_dim, rng)
+        else:
+            seed = sample_density_by_metric(metric, total_dim, rng)
+        target = sample_reachable_purity_target(seed, total_dim, config.eta, rng, regime=regime)
+        return mix_with_identity_to_purity(seed, target)
+    return sample_density_by_metric(metric, total_dim, rng)
+
+
+def sample_separable_state_for_config(
+    dims: Tuple[int, int],
+    metric: str,
+    rng: np.random.Generator,
+    config: DatasetConfig,
+    metric_local: bool = False,
+) -> np.ndarray:
+    """Sample a separable candidate respecting the configured purity mode."""
+
+    _, mode = validate_purity_generation_config(config)
+    d_a, d_b = dims
+    if (
+        config.purity_filter
+        and mode == "targeted"
+        and not purity_windows_cover_full_range(d_a * d_b, config.eta)
+    ):
+        return sample_extreme_purity_separable_state(
+            d_a,
+            d_b,
+            rng=rng,
+            eta=config.eta,
+            regime=targeted_purity_regime(rng),
+            mixture_terms=config.sep_mixture_terms,
+        )
+    if metric_local:
+        return metric_distributed_separable_state(
+            d_a,
+            d_b,
+            metric=metric,
+            rng=rng,
+            mixture_terms=config.sep_mixture_terms,
+        )
+    return random_separable_state(
+        d_a,
+        d_b,
+        rng=rng,
+        mixture_terms=config.sep_mixture_terms,
+    )
+
+
+def finalize_dataset_rows(rows: List[Dict[str, float]], config: DatasetConfig) -> pd.DataFrame:
+    """Shuffle and return the feature-only dataset in the existing format."""
+
+    if not rows:
+        raise RuntimeError("No states were accepted; cannot build an empty dataset.")
+    df = pd.DataFrame(rows)
+    df = df.sample(frac=1.0, random_state=config.random_state).reset_index(drop=True)
+    df["y"] = df["y"].astype(int)
+    return df
+
+
+def quota_remaining(label: int, accepted_counts: Mapping[int, int], config: DatasetConfig) -> bool:
+    """Return True when another row of this label is still requested."""
+
+    if label == ENTANGLED_LABEL:
+        return accepted_counts.get(ENTANGLED_LABEL, 0) < config.n_entangled
+    if label == SEPARABLE_LABEL:
+        return accepted_counts.get(SEPARABLE_LABEL, 0) < config.n_separable
+    return False
+
+
+def requested_quotas_met(accepted_counts: Mapping[int, int], config: DatasetConfig) -> bool:
+    """Return True when both requested label counts have been accepted."""
+
+    return (
+        accepted_counts.get(ENTANGLED_LABEL, 0) >= config.n_entangled
+        and accepted_counts.get(SEPARABLE_LABEL, 0) >= config.n_separable
+    )
+
+
+def accept_labelled_state_if_needed(
+    rows: List[Dict[str, float]],
+    rho: np.ndarray,
+    dims: Tuple[int, int],
+    label: Optional[int],
+    accepted_counts: Dict[int, int],
+    config: DatasetConfig,
+) -> bool:
+    """Append a labelled state when its requested class still has capacity."""
+
+    if (
+        label is None
+        or not quota_remaining(label, accepted_counts, config)
+        or not purity_accepts_state(rho, dims, config)
+    ):
+        return False
+    append_state_row(rows, rho, dims, label, config)
+    accepted_counts[label] = accepted_counts.get(label, 0) + 1
+    return True
+
+
+def generate_dataset_method_1(config: DatasetConfig) -> pd.DataFrame:
     """Generate a balanced feature-only dataset.
 
     The returned DataFrame contains no raw density matrices. It contains flat
-    feature columns, the label column y, and optionally a diagnostic purity
-    column. When config.purity_filter is enabled, every accepted state must lie
-    in either [1/d, 1/d + eta] or [1 - eta, 1].
+    feature columns and the label column y.
+
+    Method 1 is the original implementation: separable states are convex
+    mixtures of product states, while entangled states are accepted from metric
+    candidates with the existing PPT/DPS/Gilbert logic.
     """
 
     dims = dims_from_system(config.system)
     d = dims[0] * dims[1]
     metric = canonical_metric(config.metric)
+    validate_purity_generation_config(config)
     rng = np.random.default_rng(config.random_state)
-    eta = validate_eta(config.eta)
-    purity_sampling_mode = str(config.purity_sampling_mode).strip().lower()
-    if purity_sampling_mode not in {"targeted", "rejection"}:
-        raise ValueError("purity_sampling_mode must be 'targeted' or 'rejection'.")
-
-    if config.purity_filter:
-        bounds = purity_window_bounds(d, eta)
-        LOGGER.info(
-            "Purity filter enabled: accepting purity in low=%s or high=%s for d=%d using %s sampling.",
-            bounds["low"],
-            bounds["high"],
-            d,
-            purity_sampling_mode,
-        )
 
     rows: List[Dict[str, float]] = []
 
@@ -833,29 +1125,11 @@ def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
     rejected_separable_by_purity = 0
     while accepted_separable < config.n_separable and separable_draws < config.max_draws:
         separable_draws += 1
-        if config.purity_filter and purity_sampling_mode == "targeted":
-            sep_regime = "low" if accepted_separable % 2 == 0 else "high"
-            rho_sep = sample_extreme_purity_separable_state(
-                dims[0],
-                dims[1],
-                rng=rng,
-                eta=eta,
-                regime=sep_regime,
-                mixture_terms=config.sep_mixture_terms,
-            )
-        else:
-            rho_sep = random_separable_state(
-                dims[0],
-                dims[1],
-                rng=rng,
-                mixture_terms=config.sep_mixture_terms,
-            )
-        p_sep = purity(rho_sep)
-        if config.purity_filter and not purity_in_extreme_regime(p_sep, d, eta):
+        rho_sep = sample_separable_state_for_config(dims, metric, rng, config)
+        if not purity_accepts_state(rho_sep, dims, config):
             rejected_separable_by_purity += 1
             continue
-
-        rows.append(feature_row(rho_sep, dims, SEPARABLE_LABEL, include_purity=config.store_purity))
+        append_state_row(rows, rho_sep, dims, SEPARABLE_LABEL, config)
         accepted_separable += 1
         if accepted_separable % 100 == 0:
             LOGGER.info("  separable: %d/%d", accepted_separable, config.n_separable)
@@ -864,18 +1138,10 @@ def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
         raise RuntimeError(
             f"Reached max_draws={config.max_draws} before collecting "
             f"{config.n_separable} separable states. Accepted {accepted_separable}; "
-            f"rejected by purity {rejected_separable_by_purity}. "
-            "Increase --eta, --max-draws, or --sep-mixture-terms."
+            f"rejected by purity {rejected_separable_by_purity}."
         )
 
-    if dims == (3, 3):
-        qutrit_labeler = QutritDPSGilbertLabeler(
-            script_path=config.qutrit_script,
-            ppt_tol=config.ppt_tol,
-            reject_ppt_without_script=config.reject_ppt_qutrit_without_script,
-        )
-    else:
-        qutrit_labeler = None
+    qutrit_labeler = build_qutrit_labeler(config, dims)
 
     LOGGER.info(
         "Generating %d entangled %s states from %s metric candidates.",
@@ -886,33 +1152,21 @@ def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
     accepted_entangled = 0
     draws = 0
     rejected_or_wrong_label = 0
+    rejected_by_purity = 0
     rejected_entangled_by_purity = 0
 
     while accepted_entangled < config.n_entangled and draws < config.max_draws:
         draws += 1
-        if config.purity_filter and purity_sampling_mode == "targeted":
-            rho = sample_extreme_purity_entangled_candidate(d, rng, eta)
-        else:
-            rho = sample_density_by_metric(metric, d, rng)
-        p_rho = purity(rho)
+        rho = sample_full_state_candidate_for_config(metric, d, rng, config)
 
-        # Apply the inexpensive purity rejection before the PPT/DPS/Gilbert
-        # labelling path. This matters especially for qutrit PPT candidates,
-        # where the attached external logic can be expensive.
-        if config.purity_filter and not purity_in_extreme_regime(p_rho, d, eta):
+        if not purity_accepts_state(rho, dims, config):
             rejected_entangled_by_purity += 1
             continue
 
-        if dims == (2, 2):
-            label = ppt_label(rho, dims=dims, tol=config.ppt_tol, subsystem=0)
-        elif dims == (3, 3):
-            assert qutrit_labeler is not None
-            label = qutrit_labeler(rho)
-        else:
-            raise NotImplementedError("Only 2x2 and 3x3 systems are supported.")
+        label = label_with_existing_criteria(rho, dims, config, qutrit_labeler)
 
         if label == ENTANGLED_LABEL:
-            rows.append(feature_row(rho, dims, ENTANGLED_LABEL, include_purity=config.store_purity))
+            append_state_row(rows, rho, dims, ENTANGLED_LABEL, config)
             accepted_entangled += 1
             if accepted_entangled % 100 == 0:
                 LOGGER.info("  entangled: %d/%d", accepted_entangled, config.n_entangled)
@@ -923,15 +1177,376 @@ def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
         raise RuntimeError(
             f"Reached max_draws={config.max_draws} before collecting "
             f"{config.n_entangled} entangled states. Accepted {accepted_entangled}; "
-            f"rejected by purity {rejected_entangled_by_purity}; "
-            f"rejected/non-entangled/inconclusive {rejected_or_wrong_label}. "
-            "For strict eta values, increase --max-draws or use a larger --eta."
+            f"rejected/non-entangled/inconclusive {rejected_or_wrong_label}; "
+            f"rejected by purity {rejected_entangled_by_purity}."
         )
 
-    df = pd.DataFrame(rows)
-    df = df.sample(frac=1.0, random_state=config.random_state).reset_index(drop=True)
-    df["y"] = df["y"].astype(int)
-    return df
+    return finalize_dataset_rows(rows, config)
+
+
+def label_name(label: int) -> str:
+    """Human-readable label name for logging."""
+
+    return "entangled" if label == ENTANGLED_LABEL else "separable"
+
+
+def requested_count_for_label(label: int, config: DatasetConfig) -> int:
+    """Requested sample count for a label."""
+
+    if label == ENTANGLED_LABEL:
+        return config.n_entangled
+    if label == SEPARABLE_LABEL:
+        return config.n_separable
+    raise ValueError(f"Unknown label: {label}")
+
+
+def collect_metric_rejection_samples(
+    rows: List[Dict[str, float]],
+    dims: Tuple[int, int],
+    metric: str,
+    rng: np.random.Generator,
+    config: DatasetConfig,
+    qutrit_labeler: Optional[QutritDPSGilbertLabeler],
+    target_label: int,
+) -> int:
+    """Method 2 helper: accept metric samples only when their label matches."""
+
+    requested = requested_count_for_label(target_label, config)
+    if requested <= 0:
+        return 0
+
+    accepted = 0
+    draws = 0
+    rejected_or_inconclusive = 0
+    rejected_by_purity = 0
+    name = label_name(target_label)
+
+    LOGGER.info(
+        "Method 2: generating %d %s %s states from %s metric rejection sampling.",
+        requested,
+        name,
+        config.system,
+        metric,
+    )
+    while accepted < requested and draws < config.max_draws:
+        draws += 1
+        rho = sample_full_state_candidate_for_config(metric, dims[0] * dims[1], rng, config)
+        if not purity_accepts_state(rho, dims, config):
+            rejected_by_purity += 1
+            continue
+        label = label_with_existing_criteria(rho, dims, config, qutrit_labeler)
+
+        if label == target_label:
+            append_state_row(rows, rho, dims, target_label, config)
+            accepted += 1
+            if accepted % 100 == 0:
+                LOGGER.info("  %s: %d/%d", name, accepted, requested)
+        else:
+            rejected_or_inconclusive += 1
+
+    if accepted < requested:
+        LOGGER.warning(
+            "Method 2 stopped after max_draws=%d while collecting %s states. "
+            "Accepted %d/%d; rejected/wrong-label/inconclusive %d. "
+            "Saving the accepted rows so downstream balancing can be handled separately.",
+            config.max_draws,
+            name,
+            accepted,
+            requested,
+            rejected_or_inconclusive + rejected_by_purity,
+        )
+    return accepted
+
+
+def generate_dataset_method_2(config: DatasetConfig) -> pd.DataFrame:
+    """Metric-consistent rejection sampling for both labels.
+
+    Every candidate state is drawn from the selected metric distribution.
+    Entangled and separable examples differ only by the acceptance criterion.
+    """
+
+    dims = dims_from_system(config.system)
+    metric = canonical_metric(config.metric)
+    validate_purity_generation_config(config)
+    rng = np.random.default_rng(config.random_state)
+    qutrit_labeler = build_qutrit_labeler(config, dims)
+    rows: List[Dict[str, float]] = []
+
+    collect_metric_rejection_samples(
+        rows,
+        dims,
+        metric,
+        rng,
+        config,
+        qutrit_labeler,
+        ENTANGLED_LABEL,
+    )
+    collect_metric_rejection_samples(
+        rows,
+        dims,
+        metric,
+        rng,
+        config,
+        qutrit_labeler,
+        SEPARABLE_LABEL,
+    )
+    return finalize_dataset_rows(rows, config)
+
+
+def random_metric_product_state(
+    d_a: int,
+    d_b: int,
+    metric: str,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate rho_A tensor rho_B with local states drawn from the metric."""
+
+    rho_a = sample_density_by_metric(metric, d_a, rng)
+    rho_b = sample_density_by_metric(metric, d_b, rng)
+    return as_density_matrix(np.kron(rho_a, rho_b))
+
+
+def metric_distributed_separable_state(
+    d_a: int,
+    d_b: int,
+    metric: str,
+    rng: np.random.Generator,
+    mixture_terms: int = 1,
+) -> np.ndarray:
+    """Generate a guaranteed separable state from metric-local product terms."""
+
+    if mixture_terms < 1:
+        raise ValueError("mixture_terms must be at least 1.")
+    if mixture_terms == 1:
+        return random_metric_product_state(d_a, d_b, metric, rng)
+
+    weights = rng.dirichlet(np.ones(mixture_terms))
+    rho = np.zeros((d_a * d_b, d_a * d_b), dtype=np.complex128)
+    for w in weights:
+        rho += w * random_metric_product_state(d_a, d_b, metric, rng)
+    return as_density_matrix(rho)
+
+
+def collect_method_1_entangled_samples(
+    rows: List[Dict[str, float]],
+    dims: Tuple[int, int],
+    metric: str,
+    rng: np.random.Generator,
+    config: DatasetConfig,
+    qutrit_labeler: Optional[QutritDPSGilbertLabeler],
+) -> int:
+    """Collect entangled metric candidates using Method 1's label logic."""
+
+    accepted_entangled = 0
+    draws = 0
+    rejected_or_wrong_label = 0
+
+    LOGGER.info(
+        "Generating %d entangled %s states from %s metric candidates.",
+        config.n_entangled,
+        config.system,
+        metric,
+    )
+    while accepted_entangled < config.n_entangled and draws < config.max_draws:
+        draws += 1
+        rho = sample_full_state_candidate_for_config(metric, dims[0] * dims[1], rng, config)
+        if not purity_accepts_state(rho, dims, config):
+            rejected_by_purity += 1
+            continue
+        label = label_with_existing_criteria(rho, dims, config, qutrit_labeler)
+
+        if label == ENTANGLED_LABEL:
+            append_state_row(rows, rho, dims, ENTANGLED_LABEL, config)
+            accepted_entangled += 1
+            if accepted_entangled % 100 == 0:
+                LOGGER.info("  entangled: %d/%d", accepted_entangled, config.n_entangled)
+        else:
+            rejected_or_wrong_label += 1
+
+    if accepted_entangled < config.n_entangled:
+        raise RuntimeError(
+            f"Reached max_draws={config.max_draws} before collecting "
+            f"{config.n_entangled} entangled states. Accepted {accepted_entangled}; "
+            f"rejected/non-entangled/inconclusive {rejected_or_wrong_label}; "
+            f"rejected by purity {rejected_by_purity}."
+        )
+    return accepted_entangled
+
+
+def generate_dataset_method_3(config: DatasetConfig) -> pd.DataFrame:
+    """Metric-distributed convex combinations for guaranteed separability.
+
+    Separable rows are labelled by construction and never sent to PPT/DPS/Gilbert.
+    Entangled rows deliberately fall back to Method 1 metric-candidate sampling.
+    """
+
+    dims = dims_from_system(config.system)
+    metric = canonical_metric(config.metric)
+    validate_purity_generation_config(config)
+    rng = np.random.default_rng(config.random_state)
+    rows: List[Dict[str, float]] = []
+
+    LOGGER.info(
+        "Method 3: generating %d guaranteed separable %s states from metric-local product mixtures.",
+        config.n_separable,
+        config.system,
+    )
+    accepted_separable = 0
+    separable_draws = 0
+    rejected_by_purity = 0
+    while accepted_separable < config.n_separable and separable_draws < config.max_draws:
+        separable_draws += 1
+        rho_sep = sample_separable_state_for_config(
+            dims,
+            metric,
+            rng,
+            config,
+            metric_local=True,
+        )
+        if not purity_accepts_state(rho_sep, dims, config):
+            rejected_by_purity += 1
+            continue
+        append_state_row(rows, rho_sep, dims, SEPARABLE_LABEL, config)
+        accepted_separable += 1
+        if accepted_separable % 100 == 0:
+            LOGGER.info("  separable: %d/%d", accepted_separable, config.n_separable)
+
+    if accepted_separable < config.n_separable:
+        raise RuntimeError(
+            f"Reached max_draws={config.max_draws} before collecting "
+            f"{config.n_separable} separable states. Accepted {accepted_separable}; "
+            f"rejected by purity {rejected_by_purity}."
+        )
+
+    qutrit_labeler = build_qutrit_labeler(config, dims)
+    collect_method_1_entangled_samples(rows, dims, metric, rng, config, qutrit_labeler)
+    return finalize_dataset_rows(rows, config)
+
+
+def depolarize_until_ppt(
+    rho: np.ndarray,
+    dims: Tuple[int, int],
+    ppt_tol: float,
+    p_step: float,
+) -> Tuple[np.ndarray, float]:
+    """Decrease p monotonically in p*rho+(1-p)I/D until the state is PPT."""
+
+    if p_step <= 0.0 or p_step > 1.0:
+        raise ValueError("method4_depolarize_step must be in the interval (0, 1].")
+
+    total_dim = dims[0] * dims[1]
+    maximally_mixed = np.eye(total_dim, dtype=np.complex128) / total_dim
+    p = 1.0
+    candidate = as_density_matrix(rho)
+    if not is_npt(candidate, dims=dims, tol=ppt_tol):
+        return candidate, p
+
+    while p > 0.0:
+        p = max(0.0, p - p_step)
+        candidate = as_density_matrix(p * rho + (1.0 - p) * maximally_mixed)
+        if not is_npt(candidate, dims=dims, tol=ppt_tol):
+            return candidate, p
+
+    return maximally_mixed, 0.0
+
+
+def generate_dataset_method_4(config: DatasetConfig) -> pd.DataFrame:
+    """Controlled depolarization of metric candidates.
+
+    Metric candidates are labelled directly when possible. After the rejection
+    counter reaches the configured threshold, failed candidates are mixed
+    monotonically with the maximally mixed state until they become PPT, then
+    labelled with the appropriate 2x2 PPT or 3x3 DPS/Gilbert logic.
+    """
+
+    if config.method4_depolarize_after < 1:
+        raise ValueError("method4_depolarize_after must be at least 1.")
+
+    dims = dims_from_system(config.system)
+    metric = canonical_metric(config.metric)
+    validate_purity_generation_config(config)
+    rng = np.random.default_rng(config.random_state)
+    qutrit_labeler = build_qutrit_labeler(config, dims)
+    rows: List[Dict[str, float]] = []
+    accepted_counts: Dict[int, int] = {
+        ENTANGLED_LABEL: 0,
+        SEPARABLE_LABEL: 0,
+    }
+
+    draws = 0
+    rejection_counter = 0
+    depolarized_attempts = 0
+
+    LOGGER.info(
+        "Method 4: generating %d entangled and %d separable %s states from %s metric candidates.",
+        config.n_entangled,
+        config.n_separable,
+        config.system,
+        metric,
+    )
+    while not requested_quotas_met(accepted_counts, config) and draws < config.max_draws:
+        draws += 1
+        rho = sample_full_state_candidate_for_config(metric, dims[0] * dims[1], rng, config)
+        label = label_with_existing_criteria(rho, dims, config, qutrit_labeler)
+
+        if accept_labelled_state_if_needed(rows, rho, dims, label, accepted_counts, config):
+            rejection_counter = 0
+            LOGGER.debug(
+                "Method 4 accepted raw %s state: entangled=%d/%d, separable=%d/%d",
+                label_name(label),
+                accepted_counts[ENTANGLED_LABEL],
+                config.n_entangled,
+                accepted_counts[SEPARABLE_LABEL],
+                config.n_separable,
+            )
+            continue
+
+        rejection_counter += 1
+        if rejection_counter < config.method4_depolarize_after:
+            continue
+
+        rho_ppt, p_value = depolarize_until_ppt(
+            rho,
+            dims=dims,
+            ppt_tol=config.ppt_tol,
+            p_step=config.method4_depolarize_step,
+        )
+        depolarized_attempts += 1
+        depolarized_label = label_with_existing_criteria(rho_ppt, dims, config, qutrit_labeler)
+
+        if accept_labelled_state_if_needed(rows, rho_ppt, dims, depolarized_label, accepted_counts, config):
+            rejection_counter = 0
+            LOGGER.debug(
+                "Method 4 accepted depolarized %s state at p=%.6f: entangled=%d/%d, separable=%d/%d",
+                label_name(depolarized_label),
+                p_value,
+                accepted_counts[ENTANGLED_LABEL],
+                config.n_entangled,
+                accepted_counts[SEPARABLE_LABEL],
+                config.n_separable,
+            )
+
+    if not requested_quotas_met(accepted_counts, config):
+        raise RuntimeError(
+            f"Reached max_draws={config.max_draws} before collecting the requested Method 4 dataset. "
+            f"Accepted entangled {accepted_counts[ENTANGLED_LABEL]}/{config.n_entangled}, "
+            f"separable {accepted_counts[SEPARABLE_LABEL]}/{config.n_separable}; "
+            f"controlled depolarization attempts {depolarized_attempts}."
+        )
+    return finalize_dataset_rows(rows, config)
+
+
+def generate_dataset(config: DatasetConfig) -> pd.DataFrame:
+    """Generate a feature-only dataset with the configured state method."""
+
+    method = canonical_generation_method(config.generation_method)
+    if method == 1:
+        return generate_dataset_method_1(config)
+    if method == 2:
+        return generate_dataset_method_2(config)
+    if method == 3:
+        return generate_dataset_method_3(config)
+    return generate_dataset_method_4(config)
 
 
 def save_dataset_bundle(
@@ -1024,6 +1639,13 @@ DEFAULT_SCENARIOS: Mapping[str, Tuple[str, ...]] = {
     "SU+RMInvariant": ("SU", "RMInvariant"),
     "Moment+RMInvariant": ("Moment", "RMInvariant"),
     "ALL": ("SU", "Moment", "RMInvariant"),
+}
+
+RFE_ABLATION_SCENARIOS: Mapping[str, Tuple[str, ...]] = {
+    "SU": DEFAULT_SCENARIOS["SU"],
+    "Moment": DEFAULT_SCENARIOS["Moment"],
+    "RMInvariant": DEFAULT_SCENARIOS["RMInvariant"],
+    "ALL": DEFAULT_SCENARIOS["ALL"],
 }
 
 # User-facing aliases for the advanced visualization interface requested in
@@ -1166,6 +1788,196 @@ def build_models(random_state: int = 42, n_jobs: int = -1) -> Dict[str, object]:
         "MLP": mlp,
     }
 
+
+MODEL_CLI_ALIASES: Mapping[str, str] = {
+    "LinearSVC": "Linear SVM",
+    "Linear_SVC": "Linear SVM",
+    "LinearSVM": "Linear SVM",
+    "Linear_SVM": "Linear SVM",
+    "Linear SVM": "Linear SVM",
+    "RBF_SVM": "RBF SVM optimized",
+    "RBF SVM": "RBF SVM optimized",
+    "RBF_SVM_optimized": "RBF SVM optimized",
+    "RBF SVM optimized": "RBF SVM optimized",
+    "RandomForest": "Random Forest",
+    "Random_Forest": "Random Forest",
+    "Random Forest": "Random Forest",
+    "MLP": "MLP",
+}
+
+MODEL_CLI_CHOICES: Tuple[str, ...] = (
+    "LinearSVC",
+    "RBF_SVM",
+    "RandomForest",
+    "MLP",
+)
+
+
+def resolve_model_cli_name(model_name: str) -> str:
+    """Map a compact CLI model name to the existing build_models key."""
+
+    if model_name in MODEL_CLI_ALIASES:
+        return MODEL_CLI_ALIASES[model_name]
+    allowed = ", ".join(MODEL_CLI_CHOICES)
+    raise ValueError(f"Unknown model '{model_name}'. Choose one of: {allowed}.")
+
+
+def build_model_from_cli_name(
+    model_name: str,
+    random_state: int = 42,
+    n_jobs: int = -1,
+    scoring: str = "balanced_accuracy",
+    cv_folds: int = 5,
+) -> object:
+    """Build one of the existing models selected by the compact CLI name."""
+
+    resolved = resolve_model_cli_name(model_name)
+    model = build_models(random_state=random_state, n_jobs=n_jobs)[resolved]
+
+    if isinstance(model, GridSearchCV):
+        model.scoring = scoring
+        model.cv = StratifiedKFold(
+            n_splits=max(2, int(cv_folds)),
+            shuffle=True,
+            random_state=random_state,
+        )
+    return model
+
+
+def rfe_importance_getter_for_model(model: object) -> str:
+    """Return the sklearn RFE importance getter for supported estimators."""
+
+    if isinstance(model, Pipeline):
+        clf = model.named_steps.get("clf")
+        if isinstance(clf, LinearSVC):
+            return "named_steps.clf.coef_"
+        if isinstance(clf, RandomForestClassifier):
+            return "named_steps.clf.feature_importances_"
+        raise ValueError(
+            "RFE ranking requires a model with coefficients or feature importances. "
+            "Use --model LinearSVC or --model RandomForest for this command."
+        )
+
+    if isinstance(model, RandomForestClassifier):
+        return "feature_importances_"
+
+    raise ValueError(
+        "RFE ranking requires a model with coefficients or feature importances. "
+        "Use --model LinearSVC or --model RandomForest for this command."
+    )
+
+
+def extract_fitted_feature_importance(model: object, n_features: int) -> np.ndarray:
+    """Extract non-negative importances from a fitted RFE-compatible model."""
+
+    fitted = EntanglementVisualizer._unwrap_grid_search(model)
+    if isinstance(fitted, Pipeline):
+        fitted = fitted.named_steps["clf"]
+
+    if hasattr(fitted, "coef_"):
+        coef = np.asarray(fitted.coef_, dtype=float)
+        if coef.ndim == 1:
+            importance = np.abs(coef)
+        else:
+            importance = np.mean(np.abs(coef), axis=0)
+    elif hasattr(fitted, "feature_importances_"):
+        importance = np.asarray(fitted.feature_importances_, dtype=float)
+    else:
+        importance = np.ones(n_features, dtype=float)
+
+    importance = np.asarray(importance, dtype=float).reshape(-1)
+    if importance.size != n_features:
+        return np.ones(n_features, dtype=float)
+    return importance
+
+
+def fit_rfe_ablation_ranking(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    feature_names: Sequence[str],
+    model: object,
+    config: EvaluationConfig,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Fit RFECV/RFE on training data and return features most-to-least important.
+
+    The returned order is intentionally most important first, because the
+    ablation curve removes the first k ranked features at each step.
+    """
+
+    n_features = int(X_train.shape[1])
+    feature_names = list(feature_names)
+    if n_features != len(feature_names):
+        raise ValueError("Feature-name count does not match X_train columns.")
+    if n_features == 1:
+        return feature_names, {
+            "method": "single_feature",
+            "ranking": {feature_names[0]: 1},
+            "ordered_features_most_to_least_important": feature_names,
+        }
+
+    importance_getter = rfe_importance_getter_for_model(model)
+    class_counts = np.unique(y_train, return_counts=True)[1]
+    min_class_count = int(np.min(class_counts)) if len(class_counts) else 0
+
+    selector = None
+    selector_method = "RFECV"
+    if config.use_rfe and min_class_count >= 2:
+        try:
+            cv = StratifiedKFold(
+                n_splits=min(config.rfe_cv, min_class_count),
+                shuffle=True,
+                random_state=config.random_state,
+            )
+            selector = RFECV(
+                estimator=clone(model),
+                step=config.rfe_step,
+                min_features_to_select=1,
+                cv=cv,
+                scoring=config.scoring,
+                n_jobs=config.n_jobs,
+                importance_getter=importance_getter,
+            )
+            selector.fit(X_train, y_train)
+        except Exception as exc:
+            LOGGER.warning("RFECV failed for ablation ranking; falling back to RFE(step=1). Error: %s", exc)
+            selector = None
+
+    if selector is None:
+        selector_method = "RFE"
+        selector = RFE(
+            estimator=clone(model),
+            n_features_to_select=1,
+            step=1,
+            importance_getter=importance_getter,
+        )
+        selector.fit(X_train, y_train)
+
+    fitted_full_model = clone(model)
+    fitted_full_model.fit(X_train, y_train)
+    importances = extract_fitted_feature_importance(fitted_full_model, n_features)
+    ranks = np.asarray(selector.ranking_, dtype=int)
+    order_idx = sorted(
+        range(n_features),
+        key=lambda idx: (int(ranks[idx]), -float(importances[idx]), feature_names[idx]),
+    )
+    ordered_features = [feature_names[idx] for idx in order_idx]
+
+    info: Dict[str, object] = {
+        "method": selector_method,
+        "ranking": {name: int(rank) for name, rank in zip(feature_names, ranks)},
+        "importance": {name: float(value) for name, value in zip(feature_names, importances)},
+        "ordered_features_most_to_least_important": ordered_features,
+    }
+    if hasattr(selector, "n_features_"):
+        info["n_features_selected_by_selector"] = int(selector.n_features_)
+    if hasattr(selector, "cv_results_"):
+        info["cv_mean_test_score"] = [
+            float(x) for x in selector.cv_results_.get("mean_test_score", [])
+        ]
+        info["cv_std_test_score"] = [
+            float(x) for x in selector.cv_results_.get("std_test_score", [])
+        ]
+    return ordered_features, info
 
 
 def safe_filename_component(text: str) -> str:
@@ -1522,6 +2334,7 @@ class EntanglementVisualizer:
             stat="density",
             common_norm=False,
         )
+        plt.yscale("log")   # ← add this line
         plt.axvline(0.0, linestyle="--", linewidth=1.0)
         plt.xlabel("Signed distance / decision-function value")
         plt.ylabel("Density")
@@ -1805,11 +2618,11 @@ def evaluate_feature_scenarios_fixed_split(
     config: EvaluationConfig = EvaluationConfig(),
     scenarios: Mapping[str, Tuple[str, ...]] = DEFAULT_SCENARIOS,
 ) -> Dict[str, object]:
-    """Run RFE and model evaluation using an explicit train/test split.
+    """Evaluate models using explicit train and unrestricted test dataframes.
 
-    This is used by the purity-constrained experiment so that the training set
-    can be purity-filtered while the test set remains sampled from the full,
-    unbiased distribution.
+    This is used by the purity-constrained experiment so the training set can
+    be filtered by purity while the held-out test set remains sampled from the
+    unrestricted data-generating distribution.
     """
 
     if "y" not in train_df.columns or "y" not in test_df.columns:
@@ -1887,6 +2700,7 @@ def evaluate_feature_scenarios_fixed_split(
                         ),
                     ])
                 else:
+                    fitted.scoring = config.scoring
                     fitted.cv = StratifiedKFold(
                         n_splits=min(3, min_class_count),
                         shuffle=True,
@@ -2054,7 +2868,10 @@ def save_purity_distribution(
     })
     dist["label"] = np.where(dist["y"] == ENTANGLED_LABEL, "entangled (-1)", "separable (+1)")
     if eta is not None:
-        dist["purity_regime"] = [purity_regime(p, total_dim=total_dim, eta=eta) for p in dist["purity"]]
+        dist["purity_regime"] = [
+            purity_regime(p, total_dim=total_dim, eta=eta)
+            for p in dist["purity"]
+        ]
     else:
         dist["purity_regime"] = "not_filtered"
 
@@ -2141,13 +2958,12 @@ def plot_performance_vs_eta(performance_df: pd.DataFrame, out_dir: str | Path) -
         for (condition, scenario), group in model_df.groupby(["training_condition", "scenario"]):
             group = group.sort_values("eta")
             linestyle = "--" if condition == "baseline" else "-"
-            label = f"{condition}: {scenario}"
             plt.plot(
                 group["log10_eta"].to_numpy(dtype=float),
                 group["accuracy"].to_numpy(dtype=float),
                 marker="o",
                 linestyle=linestyle,
-                label=label,
+                label=f"{condition}: {scenario}",
             )
 
         plt.xlabel(r"$\log_{10}(\eta)$")
@@ -2174,6 +2990,7 @@ def write_purity_comparison_report(performance_df: pd.DataFrame, out_path: str |
     lines.append("Purity-constrained training comparison")
     lines.append("Baseline trains on an unrestricted distribution; constrained trains only on extreme-purity states.")
     lines.append("The test set is the same unrestricted dataset for both conditions.")
+    lines.append("Targeted sampling is a controlled extreme-purity distribution, not a strict metric-conditioned sample.")
     lines.append("")
 
     constrained = performance_df[performance_df["training_condition"] == "purity_constrained"]
@@ -2229,14 +3046,16 @@ def run_purity_experiment(
     scenarios: Mapping[str, Tuple[str, ...]] = DEFAULT_SCENARIOS,
     write_npz: bool = True,
     purity_sampling_mode: str = "targeted",
+    generation_method: int = 1,
 ) -> Dict[str, object]:
-    """Run baseline and purity-constrained training with an unbiased test set."""
+    """Run baseline and purity-constrained training with an unrestricted test set."""
 
     if not eta_values:
         raise ValueError("At least one eta value is required.")
     eta_values = [validate_eta(e) for e in eta_values]
     if any(e <= 0.0 for e in eta_values):
         raise ValueError("purity_experiment requires eta > 0 for the log10(eta) performance plot.")
+    canonical_purity_sampling_mode(purity_sampling_mode)
 
     dims = dims_from_system(system)
     total_dim = dims[0] * dims[1]
@@ -2260,6 +3079,7 @@ def run_purity_experiment(
         return DatasetConfig(
             system=system,
             metric=metric,
+            generation_method=generation_method,
             n_entangled=n_entangled,
             n_separable=n_separable,
             sep_mixture_terms=sep_mixture_terms,
@@ -2401,12 +3221,323 @@ def run_purity_experiment(
         "performance_plots": performance_plot_paths,
         "evaluation_config": asdict(eval_config),
         "purity_sampling_mode": purity_sampling_mode,
+        "sampling_caveat": (
+            "targeted mode is a controlled extreme-purity distribution, "
+            "not a strict Bures/Hilbert-Schmidt-conditioned sample"
+        ),
     }
 
     summary_path = out / "purity_experiment_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     summary["summary_json"] = str(summary_path)
     return summary
+
+
+# ---------------------------------------------------------------------------
+# RFE ablation visualization
+# ---------------------------------------------------------------------------
+
+def output_path_for_feature_set(path: str | Path, feature_set: str, multiple_feature_sets: bool) -> Path:
+    """Append the feature-set name to an output path when several plots are requested."""
+
+    out_path = Path(path)
+    if not multiple_feature_sets:
+        return out_path
+    return out_path.with_name(
+        f"{out_path.stem}_{safe_filename_component(feature_set)}{out_path.suffix}"
+    )
+
+
+def scoring_axis_label(scoring: str) -> str:
+    """Human-readable y-axis label for a sklearn scoring name."""
+
+    if scoring == "balanced_accuracy":
+        return "Balanced accuracy"
+    if scoring == "accuracy":
+        return "Accuracy"
+    return scoring.replace("_", " ").capitalize()
+
+
+def configure_ablation_fit_model(
+    model: object,
+    y_train: np.ndarray,
+    random_state: int,
+    scoring: str,
+    cv_folds: int,
+) -> object:
+    """Adjust CV-backed models for the current train split."""
+
+    fitted_model = clone(model)
+    class_counts = np.unique(y_train, return_counts=True)[1]
+    min_class_count = int(np.min(class_counts)) if len(class_counts) else 0
+
+    if isinstance(fitted_model, GridSearchCV):
+        if min_class_count < 2:
+            fitted_model = Pipeline([
+                ("scaler", StandardScaler()),
+                (
+                    "clf",
+                    SVC(
+                        kernel="rbf",
+                        C=1.0,
+                        gamma="scale",
+                        class_weight="balanced",
+                        probability=True,
+                        random_state=random_state,
+                    ),
+                ),
+            ])
+        else:
+            fitted_model.scoring = scoring
+            fitted_model.cv = StratifiedKFold(
+                n_splits=min(max(2, int(cv_folds)), min_class_count),
+                shuffle=True,
+                random_state=random_state,
+            )
+
+    if isinstance(fitted_model, Pipeline):
+        clf = fitted_model.named_steps.get("clf")
+        if isinstance(clf, MLPClassifier) and (min_class_count < 3 or len(y_train) < 20):
+            try:
+                fitted_model.set_params(clf__early_stopping=False)
+            except ValueError:
+                pass
+
+    return fitted_model
+
+
+def rfe_ablation_curve(
+    df: pd.DataFrame,
+    feature_set: str,
+    model_name: str = "LinearSVC",
+    config: EvaluationConfig = EvaluationConfig(use_rfe=True),
+    repeats: int = 5,
+    out_path: str | Path = "rfe_ablation.png",
+    out_csv: Optional[str | Path] = None,
+    threshold_fraction: float = 0.90,
+) -> Dict[str, object]:
+    """Compute and plot accuracy degradation after removing RFE-ranked features.
+
+    A single train/test split is held fixed for all ablation steps. The RFE
+    ranking is fitted only on the training split, then the top-k ranked features
+    are removed for k=0..n_features-1. At each k, the selected model is refit
+    ``repeats`` times with reproducibly varied random seeds and scored on the
+    unchanged held-out test split.
+    """
+
+    if "y" not in df.columns:
+        raise ValueError("Dataset must contain a y column.")
+    if feature_set not in RFE_ABLATION_SCENARIOS:
+        allowed = ", ".join(RFE_ABLATION_SCENARIOS)
+        raise ValueError(f"Unknown feature_set '{feature_set}'. Choose one of: {allowed}.")
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1.")
+    if config.rfe_cv < 2:
+        raise ValueError("cv_folds must be at least 2.")
+    if threshold_fraction <= 0.0:
+        raise ValueError("threshold_fraction must be positive.")
+
+    try:
+        scorer = get_scorer(config.scoring)
+    except Exception as exc:
+        raise ValueError(f"Unknown or unsupported scoring value '{config.scoring}'.") from exc
+
+    cols = columns_for_scenario(df, RFE_ABLATION_SCENARIOS[feature_set])
+    n_features = len(cols)
+    if n_features <= 3:
+        LOGGER.warning(
+            "Feature set %s has only %d feature(s); the ablation curve will be coarse.",
+            feature_set,
+            n_features,
+        )
+
+    y = df["y"].to_numpy(dtype=int)
+    X = df[cols].to_numpy(dtype=float)
+    row_indices = np.arange(len(df))
+    try:
+        train_idx, test_idx = train_test_split(
+            row_indices,
+            test_size=config.test_size,
+            random_state=config.random_state,
+            stratify=y,
+        )
+    except ValueError as exc:
+        LOGGER.warning("Stratified train/test split failed; using an unstratified split. Error: %s", exc)
+        train_idx, test_idx = train_test_split(
+            row_indices,
+            test_size=config.test_size,
+            random_state=config.random_state,
+            stratify=None,
+        )
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    ranking_model = build_model_from_cli_name(
+        model_name,
+        random_state=config.random_state,
+        n_jobs=config.n_jobs,
+        scoring=config.scoring,
+        cv_folds=config.rfe_cv,
+    )
+    ordered_features, rfe_info = fit_rfe_ablation_ranking(
+        X_train,
+        y_train,
+        cols,
+        ranking_model,
+        config,
+    )
+    ordered_indices = [cols.index(name) for name in ordered_features]
+
+    mean_scores: List[float] = []
+    std_scores: List[float] = []
+    all_scores: List[List[float]] = []
+
+    for n_removed in range(n_features):
+        remaining_idx = ordered_indices[n_removed:]
+        X_train_reduced = X_train[:, remaining_idx]
+        X_test_reduced = X_test[:, remaining_idx]
+        repeat_scores: List[float] = []
+
+        for repeat_idx in range(repeats):
+            rng = np.random.default_rng(int(config.random_state) + repeat_idx)
+            repeat_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            base_model = build_model_from_cli_name(
+                model_name,
+                random_state=repeat_seed,
+                n_jobs=config.n_jobs,
+                scoring=config.scoring,
+                cv_folds=config.rfe_cv,
+            )
+            fit_model = configure_ablation_fit_model(
+                base_model,
+                y_train=y_train,
+                random_state=repeat_seed,
+                scoring=config.scoring,
+                cv_folds=config.rfe_cv,
+            )
+            fit_model.fit(X_train_reduced, y_train)
+            try:
+                repeat_scores.append(float(scorer(fit_model, X_test_reduced, y_test)))
+            except Exception as exc:
+                raise ValueError(
+                    f"Scoring '{config.scoring}' is not supported by model '{model_name}'."
+                ) from exc
+
+        all_scores.append(repeat_scores)
+        mean_scores.append(float(np.mean(repeat_scores)))
+        std_scores.append(float(np.std(repeat_scores, ddof=1)) if repeats > 1 else 0.0)
+
+    n_removed_values = np.arange(n_features, dtype=int)
+    n_remaining_values = n_features - n_removed_values
+    result_df = pd.DataFrame({
+        "n_removed": n_removed_values,
+        "n_remaining": n_remaining_values,
+        "mean_score": mean_scores,
+        "std_score": std_scores,
+    })
+
+    baseline_score = float(mean_scores[0])
+    threshold_score = threshold_fraction * baseline_score
+    below_threshold = np.where(np.asarray(mean_scores, dtype=float) < threshold_score)[0]
+    threshold_k = int(below_threshold[0]) if len(below_threshold) else None
+    best_k = int(np.argmax(mean_scores))
+    best_score = float(mean_scores[best_k])
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    y_label = scoring_axis_label(config.scoring)
+
+    plt.figure(figsize=(7.5, 5.0))
+    plt.errorbar(
+        n_removed_values,
+        mean_scores,
+        yerr=std_scores,
+        marker="o",
+        linewidth=1.7,
+        capsize=3,
+        label="Mean score +/- 1 std",
+    )
+    plt.axhline(
+        baseline_score,
+        linestyle="--",
+        linewidth=1.0,
+        color="0.35",
+        label=f"Full-feature baseline = {baseline_score:.3f}",
+    )
+    if threshold_k is not None:
+        threshold_value = float(mean_scores[threshold_k])
+        plt.axvline(threshold_k, linestyle="--", linewidth=1.0, color="tab:red")
+        plt.annotate(
+            f"threshold at k={threshold_k} (score={threshold_value:.3f})",
+            xy=(threshold_k, threshold_value),
+            xytext=(6, 8),
+            textcoords="offset points",
+            fontsize=9,
+            color="tab:red",
+        )
+    plt.xlabel("Number of features removed")
+    plt.ylabel(y_label)
+    plt.title(f"RFE ablation: accuracy vs features removed — {feature_set}")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    out_csv_path: Optional[Path] = Path(out_csv) if out_csv is not None else None
+    if out_csv_path is not None:
+        out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        result_df.to_csv(out_csv_path, index=False)
+
+    ranking_base = out_csv_path if out_csv_path is not None else out_path
+    ranking_path = ranking_base.with_name(f"{ranking_base.stem}_ranking.json")
+    ranking_payload: Dict[str, object] = {
+        "feature_set": feature_set,
+        "model": model_name,
+        "resolved_model": resolve_model_cli_name(model_name),
+        "scoring": config.scoring,
+        "random_state": int(config.random_state),
+        "test_size": float(config.test_size),
+        "cv_folds": int(config.rfe_cv),
+        "repeats": int(repeats),
+        "threshold_fraction": float(threshold_fraction),
+        "baseline_score": baseline_score,
+        "threshold_k": threshold_k,
+        "best_k": best_k,
+        "best_score": best_score,
+        "ranking": ordered_features,
+        "rfe_info": rfe_info,
+        "repeat_scores": {
+            str(int(k)): [float(score) for score in scores]
+            for k, scores in zip(n_removed_values, all_scores)
+        },
+        "plot": str(out_path),
+        "csv": str(out_csv_path) if out_csv_path is not None else None,
+    }
+    ranking_path.write_text(json.dumps(ranking_payload, indent=2), encoding="utf-8")
+
+    threshold_text = "not reached" if threshold_k is None else str(threshold_k)
+    print(
+        f"RFE ablation {feature_set}: baseline={baseline_score:.6f}, "
+        f"threshold_k={threshold_text}, best_k={best_k} (score={best_score:.6f})"
+    )
+    print(f"Saved plot: {out_path}")
+    if out_csv_path is not None:
+        print(f"Saved CSV: {out_csv_path}")
+    print(f"Saved ranking: {ranking_path}")
+
+    return {
+        "feature_set": feature_set,
+        "plot": str(out_path),
+        "csv": str(out_csv_path) if out_csv_path is not None else None,
+        "ranking_json": str(ranking_path),
+        "baseline_score": baseline_score,
+        "threshold_k": threshold_k,
+        "best_k": best_k,
+        "best_score": best_score,
+        "results": result_df,
+        "ranking": ordered_features,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2604,19 +3735,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     gen = subparsers.add_parser("generate", help="Generate a feature-only dataset.")
     gen.add_argument("--system", required=True, choices=["2x2", "3x3"])
     gen.add_argument("--metric", default="bures", choices=["bures", "hs", "hilbert-schmidt"])
+    # CLI documentation: choose the state generator with --generation-method {1,2,3,4}.
+    gen.add_argument(
+        "--generation-method",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4],
+        help=(
+            "State generation method: 1=existing logic, "
+            "2=metric rejection sampling, "
+            "3=metric-local separable mixtures plus Method 1 entangled, "
+            "4=controlled depolarization."
+        ),
+    )
     gen.add_argument("--n-entangled", type=int, required=True)
     gen.add_argument("--n-separable", type=int, required=True)
     gen.add_argument("--sep-mixture-terms", type=int, default=1)
     gen.add_argument("--max-draws", type=int, default=10_000_000)
+    gen.add_argument(
+        "--method4-depolarize-after",
+        type=int,
+        default=1000,
+        help="Method 4 starts depolarizing only after this many rejected/unneeded candidates.",
+    )
+    gen.add_argument(
+        "--method4-depolarize-step",
+        type=float,
+        default=0.01,
+        help="Method 4 monotonic p decrement for rho(p)=p*rho+(1-p)I/D.",
+    )
     gen.add_argument("--ppt-tol", type=float, default=1e-10)
     gen.add_argument("--qutrit-script", default=None, help="Path to attached 3x3_svm.py for PPT qutrit states.")
     gen.add_argument("--no-reject-ppt-qutrit-without-script", action="store_true")
-    gen.add_argument("--purity-filter", action="store_true",
-                     help="Accept only states with purity in [1/d, 1/d+eta] or [1-eta, 1].")
+    gen.add_argument(
+        "--purity-filter",
+        action="store_true",
+        help="Accept only states with purity in [1/D, 1/D+eta] or [1-eta, 1].",
+    )
     gen.add_argument("--eta", type=float, default=0.02,
                      help="Purity-window width used with --purity-filter.")
-    gen.add_argument("--purity-sampling-mode", choices=["targeted", "rejection"], default="targeted",
-                     help="How to sample when --purity-filter is enabled. 'targeted' is efficient for small eta; 'rejection' keeps the original metric/product candidate samplers.")
+    gen.add_argument(
+        "--purity-sampling-mode",
+        choices=["targeted", "rejection"],
+        default="targeted",
+        help=(
+            "How to sample when --purity-filter is enabled. 'targeted' is a controlled "
+            "extreme-purity distribution; 'rejection' keeps the original candidate samplers."
+        ),
+    )
     gen.add_argument("--no-purity-column", action="store_true",
                      help="Do not store the diagnostic purity column in the output CSV.")
     gen.add_argument("--random-state", type=int, default=42)
@@ -2650,18 +3816,65 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tsne.add_argument("--perplexity", type=float, default=30.0)
     tsne.add_argument("--random-state", type=int, default=42)
 
+    rfe_ab = subparsers.add_parser(
+        "ts_rfe_ablation",
+        help="Plot held-out score vs number of top-ranked RFE features removed.",
+    )
+    rfe_ab.add_argument("--dataset", required=True, help="CSV or NPZ dataset path.")
+    rfe_ab.add_argument(
+        "--feature-set",
+        nargs="+",
+        required=True,
+        choices=list(RFE_ABLATION_SCENARIOS),
+        help="One or more feature sets: SU, Moment, RMInvariant, or ALL.",
+    )
+    rfe_ab.add_argument(
+        "--model",
+        default="LinearSVC",
+        choices=list(MODEL_CLI_CHOICES),
+        help="Model used for RFE ranking and repeated ablation fits.",
+    )
+    rfe_ab.add_argument("--cv-folds", type=int, default=5,
+                        help="RFECV folds; capped by the smallest training class count.")
+    rfe_ab.add_argument("--repeats", type=int, default=5,
+                        help="Repeated refits per ablation point.")
+    rfe_ab.add_argument("--scoring", default="balanced_accuracy",
+                        help="Any sklearn scorer name supported by the selected model.")
+    rfe_ab.add_argument("--test-size", type=float, default=0.30,
+                        help="Fixed held-out test fraction.")
+    rfe_ab.add_argument("--random-state", type=int, default=42)
+    rfe_ab.add_argument("--n-jobs", type=int, default=-1)
+    rfe_ab.add_argument("--rfe-step", type=float, default=0.10,
+                        help="RFECV feature-removal step.")
+    rfe_ab.add_argument("--no-rfecv", action="store_true",
+                        help="Use plain RFE(step=1) instead of RFECV for the ranking.")
+    rfe_ab.add_argument("--baseline-fraction", type=float, default=0.90,
+                        help="Annotate first k whose mean score drops below this fraction of baseline.")
+    rfe_ab.add_argument("--out", required=True, help="Output PNG path.")
+    rfe_ab.add_argument("--out-csv", default=None,
+                        help="Optional CSV path for n_removed, n_remaining, mean_score, std_score.")
+
     purity_exp = subparsers.add_parser(
         "purity_experiment",
         help="Compare baseline training with purity-constrained training on an unrestricted test set.",
     )
     purity_exp.add_argument("--system", required=True, choices=["2x2", "3x3"])
     purity_exp.add_argument("--metric", default="bures", choices=["bures", "hs", "hilbert-schmidt"])
+    purity_exp.add_argument("--generation-method", type=int, default=1, choices=[1, 2, 3, 4],
+                            help="Dataset-generation method used for baseline, test, and constrained training sets.")
     purity_exp.add_argument("--eta", type=float, default=0.02,
                             help="Single eta value for the purity-constrained training experiment.")
     purity_exp.add_argument("--eta-grid", type=float, nargs="+", default=None,
                             help="Optional list of eta values. Overrides --eta and enables performance-vs-eta curves.")
-    purity_exp.add_argument("--purity-sampling-mode", choices=["targeted", "rejection"], default="targeted",
-                            help="How to sample constrained training data. 'targeted' is efficient for small eta; 'rejection' keeps the original metric/product candidate samplers.")
+    purity_exp.add_argument(
+        "--purity-sampling-mode",
+        choices=["targeted", "rejection"],
+        default="targeted",
+        help=(
+            "How to sample constrained training data. 'targeted' is efficient but not "
+            "a strict metric-conditioned sample; 'rejection' keeps original candidate samplers."
+        ),
+    )
     purity_exp.add_argument("--n-train", type=int, required=True,
                             help="Total training rows per condition; split as evenly as possible by class.")
     purity_exp.add_argument("--n-test", type=int, required=True,
@@ -2715,10 +3928,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = DatasetConfig(
             system=args.system,
             metric=args.metric,
+            generation_method=args.generation_method,
             n_entangled=args.n_entangled,
             n_separable=args.n_separable,
             sep_mixture_terms=args.sep_mixture_terms,
             max_draws=args.max_draws,
+            method4_depolarize_after=args.method4_depolarize_after,
+            method4_depolarize_step=args.method4_depolarize_step,
             ppt_tol=args.ppt_tol,
             qutrit_script=args.qutrit_script,
             reject_ppt_qutrit_without_script=not args.no_reject_ppt_qutrit_without_script,
@@ -2787,6 +4003,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scenarios=scenarios,
             write_npz=not args.no_npz,
             purity_sampling_mode=args.purity_sampling_mode,
+            generation_method=args.generation_method,
         )
         LOGGER.info("Saved purity experiment summary to %s", summary.get("summary_json"))
         return 0
@@ -2804,6 +4021,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.info("Saved t-SNE plot to %s", args.out)
         return 0
 
+    if args.command == "ts_rfe_ablation":
+        df = load_dataset(args.dataset)
+        cfg = EvaluationConfig(
+            test_size=args.test_size,
+            random_state=args.random_state,
+            use_rfe=not args.no_rfecv,
+            rfe_step=args.rfe_step,
+            rfe_cv=args.cv_folds,
+            n_jobs=args.n_jobs,
+            scoring=args.scoring,
+        )
+        multiple_feature_sets = len(args.feature_set) > 1
+        for feature_set in args.feature_set:
+            out_path = output_path_for_feature_set(args.out, feature_set, multiple_feature_sets)
+            out_csv = (
+                output_path_for_feature_set(args.out_csv, feature_set, multiple_feature_sets)
+                if args.out_csv is not None
+                else None
+            )
+            rfe_ablation_curve(
+                df,
+                feature_set=feature_set,
+                model_name=args.model,
+                config=cfg,
+                repeats=args.repeats,
+                out_path=out_path,
+                out_csv=out_csv,
+                threshold_fraction=args.baseline_fraction,
+            )
+        return 0
+
     parser.error(f"Unknown command: {args.command}")
     return 2
 
@@ -2811,4 +4059,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-# End of entanglement_ml_pipeline_v2.py
+# End of entanglement_ml_pipeline_v3.py
